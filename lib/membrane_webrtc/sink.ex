@@ -170,6 +170,15 @@ defmodule Membrane.WebRTC.Sink do
   end
 
   @impl true
+  def handle_pad_removed(Pad.ref(:input, pid) = pad_ref, ctx, state) do
+    children =
+      [{:connector, pad_ref}, {:rtp_payloader, pad_ref}, {:rtp_opus_payloader, pid}]
+      |> Enum.filter(&Map.has_key?(ctx.children, &1))
+
+    {[remove_children: children], state}
+  end
+
+  @impl true
   def handle_child_notification(
         {:stream_format, _connector_pad, _stream_format},
         {:connector, pad_ref},

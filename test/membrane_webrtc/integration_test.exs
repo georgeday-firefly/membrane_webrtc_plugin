@@ -183,6 +183,69 @@ defmodule Membrane.WebRTC.IntegrationTest do
     end
   end
 
+  defmodule Relink do
+    use ExUnit.Case, async: true
+
+    import Membrane.Testing.Assertions
+
+    test "a replacement source can be linked to a video pad after its predecessor was removed" do
+      signaling = Signaling.new()
+
+      video_src = %KeyframeTestSource{
+        stream_format: %Membrane.RemoteStream{content_format: Membrane.VP8, type: :packetized}
+      }
+
+      send_pipeline =
+        Testing.Pipeline.start_link_supervised!(
+          spec: [
+            child(:webrtc, %WebRTC.Sink{signaling: signaling, tracks: [:video]}),
+            child(:vid1, video_src)
+            |> via_in(Pad.ref(:input, :video), options: [kind: :video])
+            |> get_child(:webrtc)
+          ]
+        )
+
+      receive_pipeline =
+        Testing.Pipeline.start_link_supervised!(
+          spec:
+            child(:webrtc, %WebRTC.Source{signaling: signaling})
+            |> via_out(:output, options: [kind: :video])
+            |> child(:sink, KeyframeTestSink)
+        )
+
+      # KeyframeTestSource emits 10 frames; the receiver's jitter buffer holds
+      # the last one until a successor arrives, so take 9 here and expect the
+      # 10th to be released by the replacement source's first packet.
+      ninth =
+        Enum.reduce(1..9, nil, fn _i, _last ->
+          assert_pipeline_notified(receive_pipeline, :sink, {:buffer, buffer}, 5_000)
+          buffer
+        end)
+
+      Testing.Pipeline.execute_actions(send_pipeline, remove_children: :vid1)
+      Process.sleep(200)
+
+      Testing.Pipeline.execute_actions(send_pipeline,
+        spec:
+          child(:vid2, video_src)
+          |> via_in(Pad.ref(:input, :video), options: [kind: :video])
+          |> get_child(:webrtc)
+      )
+
+      assert_pipeline_notified(receive_pipeline, :sink, {:buffer, tenth}, 5_000)
+      assert_pipeline_notified(receive_pipeline, :sink, {:buffer, first_after}, 5_000)
+
+      # Same track, no gap in sequence numbers and time keeps moving forward
+      assert tenth.metadata.rtp.sequence_number == ninth.metadata.rtp.sequence_number + 1
+      assert first_after.metadata.rtp.ssrc == tenth.metadata.rtp.ssrc
+      assert first_after.metadata.rtp.sequence_number == tenth.metadata.rtp.sequence_number + 1
+      assert first_after.metadata.rtp.timestamp > tenth.metadata.rtp.timestamp
+
+      Testing.Pipeline.terminate(send_pipeline)
+      Testing.Pipeline.terminate(receive_pipeline)
+    end
+  end
+
   defmodule SendRecv do
     use ExUnit.Case, async: true
 

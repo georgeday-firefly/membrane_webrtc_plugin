@@ -38,6 +38,9 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
      %{
        pc: nil,
        input_tracks: %{},
+       # RTP state of tracks whose pad was removed, so a replacement pad
+       # continues the same sequence numbers on the same sender
+       detached_params: %{},
        queued_tracks: Enum.map(opts.tracks, &%{kind: &1, notify: false}),
        negotiating_tracks: [],
        negotiated_tracks: [],
@@ -116,20 +119,54 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
 
     negotiated_tracks = List.delete(negotiated_tracks, track)
 
-    params = %{
-      kind: track.kind,
-      clock_rate:
-        case track.kind do
-          :audio -> ExWebRTCUtils.codec_clock_rate(:opus)
-          :video -> ExWebRTCUtils.codec_clock_rate(state.video_codec)
-        end,
-      seq_num: Enum.random(0..@max_rtp_seq_num),
-      last_keyframe_request_ts: Membrane.Time.monotonic_time() - @keyframe_request_throttle_time
-    }
+    {resumed, detached_params} = Map.pop(state.detached_params, track.id)
+
+    params =
+      resumed ||
+        %{
+          kind: track.kind,
+          clock_rate:
+            case track.kind do
+              :audio -> ExWebRTCUtils.codec_clock_rate(:opus)
+              :video -> ExWebRTCUtils.codec_clock_rate(state.video_codec)
+            end,
+          seq_num: Enum.random(0..@max_rtp_seq_num),
+          ts_offset: 0,
+          last_timestamp: nil,
+          resumed: false,
+          last_keyframe_request_ts:
+            Membrane.Time.monotonic_time() - @keyframe_request_throttle_time
+        }
 
     input_tracks = Map.put(input_tracks, pad, {track.id, params})
-    state = %{state | negotiated_tracks: negotiated_tracks, input_tracks: input_tracks}
+
+    state = %{
+      state
+      | negotiated_tracks: negotiated_tracks,
+        input_tracks: input_tracks,
+        detached_params: detached_params
+    }
+
     {[], state}
+  end
+
+  @impl true
+  def handle_pad_removed(pad, _ctx, state) do
+    case Map.pop(state.input_tracks, pad) do
+      {nil, _input_tracks} ->
+        {[], state}
+
+      {{id, params}, input_tracks} ->
+        track = %{kind: params.kind, notify: false, id: id}
+
+        {[],
+         %{
+           state
+           | input_tracks: input_tracks,
+             negotiated_tracks: [track | state.negotiated_tracks],
+             detached_params: Map.put(state.detached_params, id, %{params | resumed: true})
+         }}
+    end
   end
 
   @impl true
@@ -363,12 +400,15 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
   defp send_buffer(pad, buffer, state) do
     {id, params} = state.input_tracks[pad]
 
-    timestamp =
+    raw_timestamp =
       Membrane.Time.divide_by_timebase(
         buffer.pts,
         Ratio.new(Membrane.Time.second(), params.clock_rate)
       )
       |> rem(@max_rtp_timestamp + 1)
+
+    params = maybe_resume_timestamps(params, raw_timestamp)
+    timestamp = rem(raw_timestamp + params.ts_offset, @max_rtp_timestamp + 1)
 
     packet =
       ExRTP.Packet.new(buffer.payload,
@@ -379,8 +419,20 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
 
     PeerConnection.send_rtp(state.pc, id, packet)
     seq_num = rem(params.seq_num + 1, @max_rtp_seq_num + 1)
-    put_in(state.input_tracks[pad], {id, %{params | seq_num: seq_num}})
+
+    put_in(state.input_tracks[pad], {id, %{params | seq_num: seq_num, last_timestamp: timestamp}})
   end
+
+  # A replacement input restarts its own clock; keep the track's RTP timestamps
+  # moving forward by continuing one frame after the last packet sent.
+  defp maybe_resume_timestamps(%{resumed: true, last_timestamp: last} = params, raw)
+       when last != nil do
+    step = div(params.clock_rate, if(params.kind == :audio, do: 50, else: 30))
+    offset = rem(last + step - raw + @max_rtp_timestamp + 1, @max_rtp_timestamp + 1)
+    %{params | ts_offset: offset, resumed: false}
+  end
+
+  defp maybe_resume_timestamps(params, _raw), do: %{params | resumed: false}
 
   defp mime_type_from_codec(:h264), do: "video/H264"
   defp mime_type_from_codec(:h265), do: "video/H265"
