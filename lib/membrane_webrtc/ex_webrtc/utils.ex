@@ -79,6 +79,46 @@ defmodule Membrane.WebRTC.ExWebRTCUtils do
     codecs |> Enum.flat_map(&codec_params/1)
   end
 
+  @doc """
+  Codec parameters for codecs we intend to *receive*.
+
+  Identical to `codec_params/1` except that H264 is registered without an
+  fmtp line, which makes it match an offer at any profile and level.
+
+  `ExWebRTC.PeerConnection.Configuration` compares the whole fmtp struct, so a
+  registration pinned to one `profile-level-id` only accepts publishers that
+  happen to choose the same one. `codec_params(:h264)` pins Constrained
+  Baseline 3.1 (`42e01f`), which Chrome on Android offers and iOS does not —
+  an iPhone or iPad offers Constrained Baseline at level 5.2 (`42e034`) and
+  High at 5.2 (`640c34`), so every H264 line in its offer is rejected and the
+  video track is negotiated with no codec at all.
+
+  A level is the wrong thing to match on in the receive direction. RFC 6184
+  makes level asymmetry explicit, and every one of these offers carries
+  `level-asymmetry-allowed=1`; a receiver is free to accept a stream encoded
+  at a level it did not itself advertise. Matching the profile alone would be
+  more precise still, but the fmtp struct compares as a unit, so dropping it
+  is what expresses "any H264" here.
+
+  Nothing is lost by being permissive: `Configuration.intersect_codecs/2`
+  answers with the *offerer's* codec parameters, not ours, so the negotiated
+  profile is whatever the publisher actually asked for.
+
+  Sending is left alone deliberately. What we offer a viewer is a claim about
+  a bitstream we are forwarding rather than encoding, so it should stay as
+  narrow as it is.
+  """
+  @spec receive_codec_params(codec_or_codecs()) :: [RTPCodecParameters.t()]
+  def receive_codec_params(:h264) do
+    codec_params(:h264) |> Enum.map(&%{&1 | sdp_fmtp_line: nil})
+  end
+
+  def receive_codec_params(codecs) when is_list(codecs) do
+    codecs |> Enum.flat_map(&receive_codec_params/1)
+  end
+
+  def receive_codec_params(codec), do: codec_params(codec)
+
   @spec codec_clock_rate(codec_or_codecs()) :: pos_integer()
   def codec_clock_rate(:opus), do: 48_000
   def codec_clock_rate(:vp8), do: 90_000
